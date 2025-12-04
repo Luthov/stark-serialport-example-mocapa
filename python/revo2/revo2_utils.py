@@ -11,16 +11,16 @@ This module provides common utility functions for Revo2 dexterous hand, includin
 import json
 import sys
 import logging
-from logger import getLogger
+from logging import getLogger
 
 # logger = getLogger(logging.DEBUG)
-logger = getLogger(logging.INFO)
+logger = getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 from bc_stark_sdk import main_mod
 
 libstark = main_mod
 libstark.init_config(libstark.StarkProtocolType.Modbus)
-
 
 async def open_modbus_revo2(port_name=None, quick=True):
     """
