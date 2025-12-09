@@ -8,6 +8,8 @@ import pickle
 import torch
 import logging
 import warnings
+from collections import defaultdict
+from typing import Callable, Any
 
 from stiffness_classifier import StiffnessClassifier
 from logger import getLogger
@@ -21,6 +23,7 @@ class AlgorithmModule:
         self.contact_threshold = contact_threshold
         self.sliding_threshold = slip_threshold
         self.device = device
+        self.num_fingers = 0
         self.stiffness_detect_step = stiffness_detect_step
 
         slip_model_path = 'models/slip_detection_model.pkl'
@@ -40,14 +43,17 @@ class AlgorithmModule:
         self.finger_names = ["Thumb", "Index", "Middle", "Ring", "Pinky"]
         self.latest_result = {
             "status": "Collecting",
-            # "contact": {},
+            "hand_released": True,
+            "contact": {},
             "sliding": {},
             "stiffness": None,
-            "hard_released": True,
             "time": datetime.now().strftime("%H:%M:%S.") + f"{datetime.now().microsecond:06d}"
         }
         self.logger = getLogger(logging.INFO)
         self.running = False
+
+        # Callback registry: event_name -> list[Callable]
+        self._callbacks = defaultdict(list)
 
     """简单 hardness(stiffness) 判断模型"""
     async def start(self):
@@ -61,10 +67,10 @@ class AlgorithmModule:
             if len(buffer) < self.data_reader.buffer.maxlen:
                 self.latest_result = {
                     "status": "Collecting",
+                    "hand_released": True,
                     "contact": {},
                     "sliding": {},
                     "stiffness": None,
-                    "hand_released": True,
                     "time:": datetime.now().strftime("%H:%M:%S.") + f"{datetime.now().microsecond:06d}"
                 }
             else:
@@ -76,67 +82,117 @@ class AlgorithmModule:
         """停止算法循环"""
         self.running = False
 
-    def _analyze(self, buffer, stiffness_):
+    # ---------- Callback management ----------
+    def register_callback(self, event: str, fn: Callable[[Any], Any]):
+        """Register a callback for a given event name (e.g., 'stiffness')."""
+        if not callable(fn):
+            raise TypeError("callback must be callable")
+        self._callbacks[event].append(fn)
 
+    def unregister_callback(self, event: str, fn: Callable[[Any], Any]):
+        """Remove a previously registered callback for an event."""
+        if event in self._callbacks and fn in self._callbacks[event]:
+            self._callbacks[event].remove(fn)
+            if not self._callbacks[event]:
+                del self._callbacks[event]
+
+    def _emit(self, event: str, payload: Any):
+        """Invoke all callbacks registered to an event; sync only for now."""
+        callbacks = list(self._callbacks.get(event, []))
+        for cb in callbacks:
+            try:
+                cb(payload)
+            except Exception as e:
+                self.logger.error(f"Callback error on event '{event}': {e}")
+
+    def _analyze(self, buffer, stiffness_):
         """
         分析 buffer 计算 contact / sliding / stiffness
         data.shape = (buffer_length, num_fingers, num_channels)
+        channel 0 = normal force
+        channel 1 = tangential force
         """
 
+        # ===== 构造数据 =====
         data = np.array([forces for _, forces in buffer])
-        # buffer_length = data.shape[0]
         contact_info = {}
         sliding_info = {}
         stiffness = None
 
-        """简单 contact 判断"""
+        # 防御式检查
+        if data.ndim != 3:
+            raise ValueError(f"Invalid data shape: {data.shape}, expect (T, F, C)")
+
+        T, F, C = data.shape
+
+        # 至少需要 2 个通道（法向 + 切向）
+        if C < 2:
+            raise ValueError("num_channels must be >= 2 (normal + tangential)")
+
+        # ===== 当前帧数据 =====
+        latest_forces = data[-1]           # shape: (num_fingers, num_channels)
+        normal_forces = latest_forces[:, 0]
+        tangential_forces = latest_forces[:, 1]
+
+        # ===== 接触检测：只使用【法向力】=====
+        contact_mask = normal_forces > self.contact_threshold
+
+        for i, (finger, is_contact) in enumerate(zip(self.finger_names, contact_mask)):
+            if is_contact:
+                contact_info[finger] = {
+                    "force": round(float(normal_forces[i]), 2)
+                }
+
+        # ===== 如果没有接触，直接返回 =====
+        if not contact_info:
+            return {
+                "status": "NO_CONTACT",
+                "hand_released": True,
+                "stiffness": None,
+                "sliding": None,
+                "contact": {},
+                "time": datetime.now().strftime("%H:%M:%S.") + f"{datetime.now().microsecond:06d}"
+            }, stiffness_
+
+        # ===== 滑动检测：只使用【切向力的方差】=====
+        # variance shape = (num_fingers, num_channels)
+        variance = np.var(data, axis=0)
+
         for i, finger in enumerate(self.finger_names):
-            latest = data[-1, i, 0] # 法向力
-            # 简单阈值检测，接触检测使用法向力
-            if latest > self.contact_threshold:
-                contact_info[finger] = {"force": int(latest)}
+            # 只有接触中的手指才可能滑动
+            if finger in contact_info:
+                tangential_var = variance[i, 1]   # 切向力方差
+                if tangential_var > self.sliding_threshold:
+                    sliding_info[finger] = {
+                        "score": round(float(tangential_var), 4)
+                    }
 
-        """简单 sliding 判断模型"""
-        # avg_force = np.mean(data, axis=0)
-        # 基于力方差的滑动检测
-        var_force = np.var(data.reshape((data.shape[0], -1)), axis=0)
-        for i, finger in enumerate(self.finger_names):
-            latest = data[-1, i, 1] # 切向力
-            if latest > self.contact_threshold:
-                contact_info[finger] = {"force": round(latest, 2)}
-            # 切向力 + 方差分析 → 滑动检测    
-            if var_force[2*i] > self.sliding_threshold and finger in contact_info:
-                sliding_info[finger] = {"score": round(var_force[2*i], 2)}
+        # ===== 判断完整接触区域（用于 stiffness）=====
+        finger_indices = {
+            2: slice(0, 2),  # 拇指 + 食指
+            3: slice(0, 3),  # 拇指 + 食指 + 中指
+            5: slice(None)   # 全部
+        }.get(self.num_fingers, slice(0))
 
-        # 状态判断
-        if contact_info:
-            if sliding_info:
-                status = "CONTACT_SLIDING"
-            else:
-                status = "CONTACT"
-            if len(stiffness_) < self.stiffness_detect_step:
-                stiffness = self._analyze_stiffness(data, self.stiffness_detect_model)
-                stiffness_.append(stiffness)
-                print(f"Stiffness:{stiffness_[-1]}")
-                # 事件驱动：立刻通知控制器
-                if self.controller:
-                    self.controller.on_stiffness_update(stiffness)
+        full_contact = bool(np.all(contact_mask[finger_indices]))
 
-        else:
-            status = "NO_CONTACT"
-            stiffness_ = []
-            stiffness = None
-            sliding_info = None
+        # ===== 刚度检测 =====
+        if full_contact and len(stiffness_) < self.stiffness_detect_step:
+            stiffness = self._analyze_stiffness(data, self.stiffness_detect_model)
+            stiffness_.append(stiffness)
 
-        # ---- 新增 hand_released 标志 ----
-        hand_released = not bool(contact_info) and not bool(sliding_info)
+            # Emit stiffness event (replaces direct controller reference)
+            self._emit("stiffness", stiffness)
+
+        # ===== 状态判断 =====
+        status = "CONTACT_SLIDING" if sliding_info else "CONTACT"
 
         return {
             "status": status,
-            "contact": contact_info,
-            "sliding": sliding_info,
+            "hand_released": False,
             "stiffness": stiffness,
-            "hand_released": hand_released,
+            "sliding": sliding_info if sliding_info else None,
+            "contact": contact_info,
             "time": datetime.now().strftime("%H:%M:%S.") + f"{datetime.now().microsecond:06d}"
         }, stiffness_
 

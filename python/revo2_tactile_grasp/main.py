@@ -16,15 +16,12 @@ async def main():
     buffer_length = 10  # 存10帧进行计算
     data_reader = DataReader(client, slave_id, sleep_time, history_len=buffer_length)
     
-    # 先创建 algorithm，不传入 controller
     algorithm = AlgorithmModule(data_reader, slip_threshold=1000)
-    
-    # 再创建 controller，传入 algorithm
     controller = TactileGraspController(client, slave_id, algorithm, enable_recording=True)
     controller.set_control_mode("AUTO")
     
-    # 最后建立双向引用
-    algorithm.controller = controller  # 绑定回调
+    # 通过回调显式注入：只订阅 stiffness 事件
+    algorithm.register_callback("stiffness", controller.on_stiffness_update)
 
     # 启动异步任务
     asyncio.create_task(data_reader.start())
@@ -37,21 +34,21 @@ async def main():
     await asyncio.sleep(2)
 
     print('演示两指抓握')
-    await controller.grasp_with_speed(num_of_fingers=2)
+    await controller.grasp_with_speed(num_fingers=2)
     await asyncio.sleep(3)
     print('释放')
     await controller.release_all_fingers()
     await asyncio.sleep(2)
     
     print('演示三指抓握')
-    await controller.grasp_with_speed(num_of_fingers=3)
+    await controller.grasp_with_speed(num_fingers=3)
     await asyncio.sleep(3)
     print('释放')
     await controller.release_all_fingers()
     await asyncio.sleep(2)
     
     print('演示五指抓握')
-    await controller.grasp_with_speed(num_of_fingers=5)
+    await controller.grasp_with_speed(num_fingers=5)
     await asyncio.sleep(5)
     print('释放')
     await controller.release_all_fingers()
