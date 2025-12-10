@@ -192,26 +192,55 @@ async def all_fingers_control_examples(client, slave_id):
     # await client.set_finger_positions_and_durations(slave_id, positions, durations)
     # await asyncio.sleep(1.0)  # Wait for fingers to reach target position
 
-    # Run control loop at 100Hz
-    loop_rate_hz = 100
+    # Configuration variables
+    loop_rate_hz = 500  # Control loop rate in Hz
+    num_interpolation_points = 500  # Number of interpolation steps for the motion
     loop_period = 1.0 / loop_rate_hz
     
+    # Define start and end positions for the motion
+    start_positions = [500] * 6
+    end_positions = [500, 500] + [1000] * 4
     speeds = [1000] * 6  # Expected speed to reach target position
+    
     while True:
-        loop_start = asyncio.get_event_loop().time()
+        # Interpolate from start to end positions
+        for step in range(num_interpolation_points):
+            loop_start = asyncio.get_event_loop().time()
+            
+            # Linear interpolation: start + (end - start) * (step / (num_points - 1))
+            t = step / (num_interpolation_points - 1) if num_interpolation_points > 1 else 1.0
+            positions = [
+                int(start_positions[i] + (end_positions[i] - start_positions[i]) * t)
+                for i in range(6)
+            ]
+            
+            await client.set_finger_positions_and_speeds(slave_id, positions, speeds)
+            
+            # Sleep for remaining time to maintain loop rate
+            elapsed = asyncio.get_event_loop().time() - loop_start
+            sleep_time = loop_period - elapsed
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
         
-        positions = [500] * 6
-        await client.set_finger_positions_and_speeds(slave_id, positions, speeds)
+        # Interpolate from end back to start positions
+        for step in range(num_interpolation_points):
+            loop_start = asyncio.get_event_loop().time()
+            
+            t = step / (num_interpolation_points - 1) if num_interpolation_points > 1 else 1.0
+            positions = [
+                int(end_positions[i] + (start_positions[i] - end_positions[i]) * t)
+                for i in range(6)
+            ]
+            
+            await client.set_finger_positions_and_speeds(slave_id, positions, speeds)
+            
+            # Sleep for remaining time to maintain loop rate
+            elapsed = asyncio.get_event_loop().time() - loop_start
+            sleep_time = loop_period - elapsed
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
         
-        # All fingers position control: target position + expected speed
-        positions = [500, 500] + [1000] * 4
-        await client.set_finger_positions_and_speeds(slave_id, positions, speeds)
-        
-        # Sleep for remaining time to maintain 100Hz rate
-        elapsed = asyncio.get_event_loop().time() - loop_start
-        sleep_time = loop_period - elapsed
-        if sleep_time > 0:
-            await asyncio.sleep(sleep_time)
+        print(f"Completed one full motion cycle ({num_interpolation_points * 2} points at {loop_rate_hz}Hz)")
 
 
 async def get_and_display_motor_status(client, slave_id):
